@@ -31,6 +31,6 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: build/app/outputs/flutter-apk/IrisMaps.apk
+          files: build/app/outputs/flutter-apk/IrisMap.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
