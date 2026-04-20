@@ -70,10 +70,6 @@ Iris Maps is a high-performance **Flutter** application designed to prevent drow
     
     ```
 
-## CI/CD Automation
-
-This project includes a **GitHub Actions** workflow that automatically compiles a release-ready APK whenever a new version tag (e.g., `v1.0.0`) is pushed to the repository.
-
 ## License
 
 This project is licensed under the **MIT License**.
