@@ -6,10 +6,14 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'package:iris_maps/services/image_enhancement_service.dart';
 import 'package:iris_maps/services/head_pose_service.dart';
+import 'package:iris_maps/services/eye_classifier_service.dart';
+import 'package:iris_maps/screens/settings_screen.dart';
+import 'package:iris_maps/screens/stats_screen.dart';
 import 'package:http/http.dart' as http;
 
 void main() async {
@@ -38,6 +42,9 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
+  // Scaffold key for programmatic drawer control
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+
   // Map State
   LatLng? _currentLocation;
   bool _isLoadingMap = true;
@@ -50,35 +57,53 @@ class _MapScreenState extends State<MapScreen> {
   LatLng? _destination;
   List<LatLng> _routePoints = [];
 
+  // Driver-Safety Thresholds
+  double eyeClosureThreshold = 0.3;
+  double headTiltSensitivity = 20.0;
+  bool isImageEnhancementEnabled = false;
+  bool isAlarmVolumeOn = true;
+
+  // Alert history for Stats screen (last 5 alerts)
+  final List<AlertEntry> _alertLog = [];
+
   // Search State
   final TextEditingController _searchController = TextEditingController();
   List<dynamic> _searchResults = [];
   bool _isSearching = false;
 
-  // Enhancement Service
+  // Enhancement Service (Member 1)
   final ImageEnhancementService _enhancementService = ImageEnhancementService();
 
   // Head Pose State (Member 2)
   final HeadPoseService _headPoseService = HeadPoseService();
-  // Message shown in the full-screen alert overlay; changes based on trigger.
   String _alertMessage = "WAKE UP!";
-  // True when a warning-level head pose event is active (non-blocking banner).
   bool _headPoseWarning = false;
   String? _headPoseWarningMessage;
+
+  // Eye Classifier (Member 3)
+  final EyeClassifierService _eyeClassifierService = EyeClassifierService();
 
   // ML Kit & Camera State
   CameraController? _cameraController;
   late final FaceDetector _faceDetector;
   bool _isProcessingImage = false;
 
+  // HUD telemetry state
+  double _hudEyeOpenness = 1.0;
+  double _hudHeadTiltAngle = 0.0;
+  HeadPoseAlertLevel _hudSafetyLevel = HeadPoseAlertLevel.safe;
+  bool _hudFaceDetected = false;
+
   @override
   void initState() {
     super.initState();
     _getUserLocation();
     _initializeSilentCamera();
+    _eyeClassifierService.loadModel();
 
     final options = FaceDetectorOptions(
       enableClassification: true,
+      enableLandmarks: true,
       enableTracking: true,
       performanceMode: FaceDetectorMode.fast,
     );
@@ -86,13 +111,43 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _getUserLocation() async {
-    Position position = await Geolocator.getCurrentPosition(
-        locationSettings:
-            const LocationSettings(accuracy: LocationAccuracy.high));
-    setState(() {
-      _currentLocation = LatLng(position.latitude, position.longitude);
-      _isLoadingMap = false;
-    });
+    try {
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        print('[IrisMaps] Location permission denied — showing fallback map.');
+        if (mounted) setState(() => _isLoadingMap = false);
+        return;
+      }
+
+      final Position position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      ).timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => throw TimeoutException('GPS fix timed out after 15s'),
+      );
+
+      if (mounted) {
+        setState(() {
+          _currentLocation = LatLng(position.latitude, position.longitude);
+          _isLoadingMap = false;
+        });
+      }
+    } on LocationServiceDisabledException {
+      print('[IrisMaps] Location services disabled — showing fallback map.');
+      if (mounted) setState(() => _isLoadingMap = false);
+    } on TimeoutException catch (e) {
+      print('[IrisMaps] $e — showing fallback map.');
+      if (mounted) setState(() => _isLoadingMap = false);
+    } catch (e) {
+      print('[IrisMaps] _getUserLocation error: $e — showing fallback map.');
+      if (mounted) setState(() => _isLoadingMap = false);
+    }
   }
 
   Future<void> _getRoute() async {
@@ -174,94 +229,121 @@ class _MapScreenState extends State<MapScreen> {
     await _cameraController!.initialize();
 
     _cameraController!.startImageStream((CameraImage image) async {
+      // Frame-drop guard: skip if the previous frame is still being processed.
+      // This keeps us comfortably above the 10 FPS target on physical hardware
+      // by ensuring the camera buffer never backs up.
       if (_isProcessingImage) return;
       _isProcessingImage = true;
 
-      // 1. Convert CameraImage bytes and optionally enhance brightness
+      // ── Step 1: Flatten CameraImage planes into a contiguous byte buffer ──
+      // NV21 (Android): planes[0] = full-res Y (luminance), planes[1] = UV.
+      // BGRA8888 (iOS): single interleaved plane.
+      // We keep rawBytes separate so the Y-plane layout is preserved for the
+      // eye-crop extraction even after enhancement may reformat the buffer.
       final WriteBuffer allBytes = WriteBuffer();
       for (final Plane plane in image.planes) {
         allBytes.putUint8List(plane.bytes);
       }
+      final Uint8List rawBytes = allBytes.done().buffer.asUint8List();
 
-      final rawBytes = allBytes.done().buffer.asUint8List();
+      // ── Step 2 (Member 1): Conditional image enhancement ──────────────────
+      // Sync the service's internal flag to our settings state so callers of
+      // _enhancementService outside this loop (e.g. the toggle button) also
+      // stay consistent.
+      _enhancementService.isEnabled = isImageEnhancementEnabled;
+      final Uint8List detectionBytes = isImageEnhancementEnabled
+          ? _enhancementService.enhanceIfDark(rawBytes, image.width, image.height)
+          : rawBytes;
 
-      final bytes = _enhancementService.enhanceIfDark(
-        rawBytes,
-        image.width,
-        image.height,
+      // ── Step 3: Build ML Kit InputImage and run face detector ─────────────
+      final inputImageFormat = Platform.isAndroid
+          ? InputImageFormat.nv21
+          : InputImageFormat.bgra8888;
+      final inputImage = InputImage.fromBytes(
+        bytes: detectionBytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: InputImageRotation.rotation270deg,
+          format: inputImageFormat,
+          bytesPerRow: image.planes[0].bytesPerRow,
+        ),
       );
 
-      final Size imageSize =
-          Size(image.width.toDouble(), image.height.toDouble());
-      const imageRotation = InputImageRotation.rotation270deg;
+      final List<Face> faces = await _faceDetector.processImage(inputImage);
 
-      final inputImageFormat =
-          Platform.isAndroid ? InputImageFormat.nv21 : InputImageFormat.bgra8888;
-      final inputImageData = InputImageMetadata(
-        size: imageSize,
-        rotation: imageRotation,
-        format: inputImageFormat,
-        bytesPerRow: image.planes[0].bytesPerRow,
-      );
-
-      final inputImage =
-          InputImage.fromBytes(bytes: bytes, metadata: inputImageData);
-
-      // 2. Run ML Kit face detector
-      final faces = await _faceDetector.processImage(inputImage);
-
-      print("AI VISION: Found ${faces.length} faces.");
-
-      // 3. Drowsiness logic: eye closure + head pose
+      // ── Step 4: Per-face pipeline ──────────────────────────────────────────
       if (faces.isNotEmpty) {
-        final face = faces.first;
+        final Face face = faces.first;
 
-        print(
-            "EYES -> Left: ${face.leftEyeOpenProbability}, Right: ${face.rightEyeOpenProbability}");
+        // -- 4a: ML Kit eye-openness probabilities (continuous 0–1 score) ----
+        final double? leftProb  = face.leftEyeOpenProbability;
+        final double? rightProb = face.rightEyeOpenProbability;
+        final double avgEyeOpenness = (leftProb != null && rightProb != null)
+            ? (leftProb + rightProb) / 2.0
+            : 1.0;
 
-        // ---- Eye closure detection ----------------------------------------
-        if (face.leftEyeOpenProbability != null &&
-            face.rightEyeOpenProbability != null) {
-          if (face.leftEyeOpenProbability! < 0.4 &&
-              face.rightEyeOpenProbability! < 0.4) {
-            _closedEyeFrames++;
-            print("WARNING: Eyes closing! Frame $_closedEyeFrames");
-
-            if (_closedEyeFrames >= 3) {
-              // Eye closure triggers the alert with the default message.
-              if (mounted) setState(() => _alertMessage = "WAKE UP!");
-              _triggerDrowsiness();
-            }
-          } else {
-            _closedEyeFrames = 0;
-          }
+        // -- 4b (Member 3): TFLite eye-classifier on Y-plane crop ------------
+        // Only run when ML Kit found an eye landmark so the crop is valid.
+        // Returns 1 (open) or 0 (closed); -1 if model not yet loaded.
+        int tfliteEyeResult = 1;
+        final leftLm  = face.landmarks[FaceLandmarkType.leftEye];
+        final rightLm = face.landmarks[FaceLandmarkType.rightEye];
+        if (leftLm != null && Platform.isAndroid) {
+          // Choose whichever eye landmark is available; left is preferred.
+          final lm = leftLm;
+          final crop = _extractEyeCrop(
+            rawBytes, image.width, image.height,
+            lm.position.x.toInt(), lm.position.y.toInt(), 24,
+          );
+          tfliteEyeResult = await _eyeClassifierService.classifyEye(crop);
         }
 
-        // ---- Head pose detection (Member 2) ----------------------------------
-        // ML Kit's headEulerAngleX/Y/Z give 3-D head orientation derived from
-        // the full face mesh — more reliable than manual landmark geometry.
-        final poseResult = _headPoseService.analyze(face);
+        // -- 4c: Eye-closure decision ----------------------------------------
+        // Primary signal: ML Kit probability vs user-configured threshold.
+        // Secondary: TFLite binary result (0 = closed).
+        // Using || keeps sensitivity high; the 3-frame debounce prevents noise.
+        final bool mlKitClosed = leftProb != null &&
+            rightProb != null &&
+            leftProb  < eyeClosureThreshold &&
+            rightProb < eyeClosureThreshold;
+        final bool tfliteClosed = tfliteEyeResult == 0;
+
+        if (mlKitClosed || tfliteClosed) {
+          _closedEyeFrames++;
+          if (_closedEyeFrames >= 3 && mounted) {
+            setState(() => _alertMessage = "WAKE UP!");
+            _triggerDrowsiness();
+          }
+        } else {
+          _closedEyeFrames = 0;
+        }
+
+        // -- 4d (Member 2): Head-pose analysis --------------------------------
+        final HeadPoseResult? poseResult = _headPoseService.analyze(face);
+        HeadPoseAlertLevel poseLevel = HeadPoseAlertLevel.safe;
 
         if (poseResult != null && mounted) {
-          print(
-              "HEAD POSE -> pitch=${poseResult.pitchAngle.toStringAsFixed(1)}° "
-              "roll=${poseResult.rollAngle.toStringAsFixed(1)}° "
-              "yaw=${poseResult.yawAngle.toStringAsFixed(1)}° "
-              "level=${poseResult.level}");
+          poseLevel = poseResult.level;
 
-          if (poseResult.level == HeadPoseAlertLevel.critical) {
-            // Critical head pose (sustained droop or sudden jerk-awake):
-            // override the alert message and fire the full alarm.
+          // User-configured tilt sensitivity gate: if the actual roll or pitch
+          // angle exceeds headTiltSensitivity AND the service also says critical,
+          // fire the alarm. This honours the settings slider.
+          final double maxAngle = poseResult.rollAngle.abs()
+              .clamp(0, double.infinity)
+              .toDouble();
+          final bool angleExceedsThreshold = maxAngle > headTiltSensitivity ||
+              poseResult.pitchAngle < -headTiltSensitivity;
+
+          if (poseResult.level == HeadPoseAlertLevel.critical &&
+              angleExceedsThreshold) {
             setState(() {
-              _alertMessage =
-                  poseResult.alertMessage ?? "Head tilt detected – Stay Alert!";
+              _alertMessage = poseResult.alertMessage ??
+                  "Head tilt detected – Stay Alert!";
               _headPoseWarning = false;
             });
             _triggerDrowsiness();
           } else if (poseResult.level == HeadPoseAlertLevel.warning &&
               poseResult.alertMessage != null) {
-            // Warning-level events (looking away, early tilt) show a
-            // non-blocking banner without triggering the full alarm.
             setState(() {
               _headPoseWarning = true;
               _headPoseWarningMessage = poseResult.alertMessage;
@@ -270,11 +352,27 @@ class _MapScreenState extends State<MapScreen> {
               _headPoseWarning) {
             setState(() => _headPoseWarning = false);
           }
+
+          // -- 4e: Update HUD telemetry ---------------------------------------
+          setState(() {
+            _hudFaceDetected    = true;
+            _hudEyeOpenness     = avgEyeOpenness;
+            _hudHeadTiltAngle   = poseResult.rollAngle.abs();
+            _hudSafetyLevel     = poseLevel;
+          });
+        } else if (poseResult == null) {
+          // Pose data not yet available this frame; keep previous HUD values
+          // but mark face as detected so the HUD doesn't show "No Face".
+          if (mounted) setState(() => _hudFaceDetected = true);
         }
       } else {
-        // No face detected: clear any lingering head-pose warning.
-        if (_headPoseWarning && mounted) {
-          setState(() => _headPoseWarning = false);
+        // No face: clear warnings and reset HUD to idle state.
+        if (mounted) {
+          setState(() {
+            _hudFaceDetected  = false;
+            _hudSafetyLevel   = HeadPoseAlertLevel.safe;
+            _headPoseWarning  = false;
+          });
         }
       }
 
@@ -284,9 +382,19 @@ class _MapScreenState extends State<MapScreen> {
 
   void _triggerDrowsiness() async {
     if (!_isDrowsy) {
-      setState(() => _isDrowsy = true);
-      await _audioPlayer.setReleaseMode(ReleaseMode.loop);
-      await _audioPlayer.play(AssetSource('alarm.mp3'));
+      setState(() {
+        _isDrowsy = true;
+        final entry = AlertEntry(
+          message: _alertMessage,
+          timestamp: DateTime.now(),
+        );
+        _alertLog.insert(0, entry);
+        if (_alertLog.length > 5) _alertLog.removeLast();
+      });
+      if (isAlarmVolumeOn) {
+        await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+        await _audioPlayer.play(AssetSource('alarm.mp3'));
+      }
     }
   }
 
@@ -302,18 +410,116 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  /// Extracts a [size]×[size] grayscale patch from the NV21 Y-plane centered
+  /// on the eye landmark at ([cx], [cy]) and returns it as a
+  /// [1][size][size][1] float tensor normalised to [0, 1].
+  ///
+  /// NV21 Y-plane: first [imgW * imgH] bytes of the concatenated plane buffer.
+  /// Pixel coordinates from ML Kit are in the rotated (display) image space.
+  /// For NV21 with rotation270: sensor_x = display_y, sensor_y = imgW-display_x.
+  List<List<List<List<double>>>> _extractEyeCrop(
+    Uint8List yPlane, int imgW, int imgH, int cx, int cy, int size,
+  ) {
+    final int half = size ~/ 2;
+    return List.generate(1, (_) =>
+      List.generate(size, (row) =>
+        List.generate(size, (col) {
+          final int sx = (cy - half + row).clamp(0, imgH - 1);
+          final int sy = (imgW - 1 - (cx - half + col)).clamp(0, imgW - 1);
+          final double pixel = (yPlane[sx * imgW + sy] & 0xFF) / 255.0;
+          return [pixel];
+        }),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _cameraController?.dispose();
     _faceDetector.close();
     _audioPlayer.dispose();
+    _eyeClassifierService.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: _scaffoldKey,
       extendBodyBehindAppBar: true,
+      drawer: Drawer(
+        backgroundColor: Colors.grey[900],
+        child: SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
+                child: Row(
+                  children: [
+                    const Icon(Icons.remove_red_eye, color: Colors.blueAccent, size: 28),
+                    const SizedBox(width: 10),
+                    Text(
+                      'Iris Maps',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(color: Colors.white24),
+              ListTile(
+                leading: const Icon(Icons.bar_chart, color: Colors.white70),
+                title: const Text('Alert Stats', style: TextStyle(color: Colors.white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => StatsScreen(alertLog: _alertLog),
+                    ),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.settings, color: Colors.white70),
+                title: const Text('Settings', style: TextStyle(color: Colors.white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => SettingsScreen(
+                        eyeClosureThreshold: eyeClosureThreshold,
+                        headTiltSensitivity: headTiltSensitivity,
+                        isImageEnhancementEnabled: isImageEnhancementEnabled,
+                        isAlarmVolumeOn: isAlarmVolumeOn,
+                        onChanged: ({
+                          required double eye,
+                          required double tilt,
+                          required bool enhance,
+                          required bool alarm,
+                        }) {
+                          setState(() {
+                            eyeClosureThreshold = eye;
+                            headTiltSensitivity = tilt;
+                            isImageEnhancementEnabled = enhance;
+                            isAlarmVolumeOn = alarm;
+                          });
+                        },
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
       body: Stack(
         children: [
           // ==========================================
@@ -401,7 +607,7 @@ class _MapScreenState extends State<MapScreen> {
                     children: [
                       IconButton(
                         icon: const Icon(Icons.menu, color: Colors.white70),
-                        onPressed: () {},
+                        onPressed: () => _scaffoldKey.currentState?.openDrawer(),
                       ),
                       Expanded(
                         child: TextField(
@@ -534,6 +740,23 @@ class _MapScreenState extends State<MapScreen> {
                   ],
                 ),
               ),
+            ),
+          ),
+
+          // ==========================================
+          // LAYER 2b: LIVE STATUS HUD CARD
+          // Compact telemetry overlay showing live pipeline outputs from all
+          // three CV modules. Positioned bottom-left, above the toggle button.
+          // ==========================================
+          Positioned(
+            bottom: 90.0,
+            left: 16.0,
+            child: _HudCard(
+              faceDetected: _hudFaceDetected,
+              eyeOpenness: _hudEyeOpenness,
+              headTiltAngle: _hudHeadTiltAngle,
+              enhancementOn: isImageEnhancementEnabled,
+              safetyLevel: _hudSafetyLevel,
             ),
           ),
 
@@ -673,6 +896,203 @@ class _MapScreenState extends State<MapScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HUD Card Widget
+// Displays live outputs from all three CV pipeline modules in a compact,
+// always-visible overlay. Purely stateless — driven by _MapScreenState.
+// ════════════════════════════════════════════════════════════════════════════
+class _HudCard extends StatelessWidget {
+  final bool faceDetected;
+  final double eyeOpenness;
+  final double headTiltAngle;
+  final bool enhancementOn;
+  final HeadPoseAlertLevel safetyLevel;
+
+  const _HudCard({
+    required this.faceDetected,
+    required this.eyeOpenness,
+    required this.headTiltAngle,
+    required this.enhancementOn,
+    required this.safetyLevel,
+  });
+
+  Color get _levelColor => switch (safetyLevel) {
+    HeadPoseAlertLevel.safe     => const Color(0xFF4CAF50),
+    HeadPoseAlertLevel.warning  => const Color(0xFFFF9800),
+    HeadPoseAlertLevel.critical => const Color(0xFFF44336),
+  };
+
+  String get _levelLabel => switch (safetyLevel) {
+    HeadPoseAlertLevel.safe     => 'SAFE',
+    HeadPoseAlertLevel.warning  => 'WARNING',
+    HeadPoseAlertLevel.critical => 'CRITICAL',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 192,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _levelColor.withValues(alpha: 0.55), width: 1.2),
+        boxShadow: const [
+          BoxShadow(color: Colors.black45, blurRadius: 8, offset: Offset(0, 3)),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Header
+          Row(
+            children: [
+              Icon(Icons.remove_red_eye, color: _levelColor, size: 13),
+              const SizedBox(width: 5),
+              Text(
+                'IRIS  LIVE STATUS',
+                style: TextStyle(
+                  color: _levelColor,
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.1,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          const Divider(height: 1, color: Colors.white12),
+          const SizedBox(height: 7),
+
+          if (!faceDetected) ...[
+            _HudRow(
+              icon: Icons.face_retouching_off,
+              label: 'No face detected',
+              valueWidget: const SizedBox.shrink(),
+              iconColor: Colors.white38,
+            ),
+          ] else ...[
+            // Eye Openness
+            _HudRow(
+              icon: Icons.visibility,
+              label: 'Eye openness',
+              valueWidget: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 42,
+                    height: 5,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(3),
+                      child: LinearProgressIndicator(
+                        value: eyeOpenness.clamp(0.0, 1.0),
+                        backgroundColor: Colors.white12,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          eyeOpenness > 0.4
+                              ? Colors.greenAccent
+                              : Colors.redAccent,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    '${(eyeOpenness * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(color: Colors.white70, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 5),
+
+            // Head Tilt
+            _HudRow(
+              icon: Icons.rotate_right,
+              label: 'Head tilt',
+              valueWidget: Text(
+                '${headTiltAngle.toStringAsFixed(1)}°',
+                style: TextStyle(
+                  color: headTiltAngle > 20
+                      ? Colors.orangeAccent
+                      : Colors.white70,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+
+          const SizedBox(height: 5),
+
+          // Preprocessing Filter
+          _HudRow(
+            icon: Icons.brightness_6,
+            label: 'Filter',
+            valueWidget: Text(
+              enhancementOn ? 'ON' : 'OFF',
+              style: TextStyle(
+                color: enhancementOn ? Colors.blueAccent : Colors.white38,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 7),
+          const Divider(height: 1, color: Colors.white12),
+          const SizedBox(height: 7),
+
+          // Safety Alert Level
+          Row(
+            children: [
+              Icon(Icons.shield, color: _levelColor, size: 12),
+              const SizedBox(width: 5),
+              Text(
+                _levelLabel,
+                style: TextStyle(
+                  color: _levelColor,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _HudRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Widget valueWidget;
+  final Color iconColor;
+
+  const _HudRow({
+    required this.icon,
+    required this.label,
+    required this.valueWidget,
+    this.iconColor = Colors.white38,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(icon, color: iconColor, size: 11),
+        const SizedBox(width: 5),
+        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 10)),
+        const Spacer(),
+        valueWidget,
+      ],
     );
   }
 }
