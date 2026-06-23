@@ -514,7 +514,7 @@ class _MapScreenState extends State<MapScreen> {
           ),
 
           // ==========================================
-          // LAYER 3: THE AI "WAKE UP" OVERLAY
+          // LAYER 3: THE "WAKE UP" OVERLAY
           // ==========================================
           IgnorePointer(
             ignoring: !_isDrowsy,
