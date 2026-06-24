@@ -57,11 +57,13 @@ class _MapScreenState extends State<MapScreen> {
   LatLng? _destination;
   List<LatLng> _routePoints = [];
 
-  // Driver-Safety Thresholds
+  // Driver-Safety Thresholds & Toggles
   double eyeClosureThreshold = 0.3;
   double headTiltSensitivity = 20.0;
   bool isImageEnhancementEnabled = false;
   bool isAlarmVolumeOn = true;
+  bool showLiveStatusHud = true; // Added for Toggleable HUD
+  bool isDeveloperModeEnabled = false; // Added for Dev Mode
 
   // Alert history for Stats screen (last 5 alerts)
   final List<AlertEntry> _alertLog = [];
@@ -87,6 +89,10 @@ class _MapScreenState extends State<MapScreen> {
   CameraController? _cameraController;
   late final FaceDetector _faceDetector;
   bool _isProcessingImage = false;
+
+  // Dev Mode Tracking Variables
+  Face? _currentFace;
+  Size? _cameraImageSize;
 
   // HUD telemetry state
   double _hudEyeOpenness = 1.0;
@@ -229,33 +235,20 @@ class _MapScreenState extends State<MapScreen> {
     await _cameraController!.initialize();
 
     _cameraController!.startImageStream((CameraImage image) async {
-      // Frame-drop guard: skip if the previous frame is still being processed.
-      // This keeps us comfortably above the 10 FPS target on physical hardware
-      // by ensuring the camera buffer never backs up.
       if (_isProcessingImage) return;
       _isProcessingImage = true;
 
-      // ── Step 1: Flatten CameraImage planes into a contiguous byte buffer ──
-      // NV21 (Android): planes[0] = full-res Y (luminance), planes[1] = UV.
-      // BGRA8888 (iOS): single interleaved plane.
-      // We keep rawBytes separate so the Y-plane layout is preserved for the
-      // eye-crop extraction even after enhancement may reformat the buffer.
       final WriteBuffer allBytes = WriteBuffer();
       for (final Plane plane in image.planes) {
         allBytes.putUint8List(plane.bytes);
       }
       final Uint8List rawBytes = allBytes.done().buffer.asUint8List();
 
-      // ── Step 2 (Member 1): Conditional image enhancement ──────────────────
-      // Sync the service's internal flag to our settings state so callers of
-      // _enhancementService outside this loop (e.g. the toggle button) also
-      // stay consistent.
       _enhancementService.isEnabled = isImageEnhancementEnabled;
       final Uint8List detectionBytes = isImageEnhancementEnabled
           ? _enhancementService.enhanceIfDark(rawBytes, image.width, image.height)
           : rawBytes;
 
-      // ── Step 3: Build ML Kit InputImage and run face detector ─────────────
       final inputImageFormat = Platform.isAndroid
           ? InputImageFormat.nv21
           : InputImageFormat.bgra8888;
@@ -271,25 +264,18 @@ class _MapScreenState extends State<MapScreen> {
 
       final List<Face> faces = await _faceDetector.processImage(inputImage);
 
-      // ── Step 4: Per-face pipeline ──────────────────────────────────────────
       if (faces.isNotEmpty) {
         final Face face = faces.first;
 
-        // -- 4a: ML Kit eye-openness probabilities (continuous 0–1 score) ----
         final double? leftProb  = face.leftEyeOpenProbability;
         final double? rightProb = face.rightEyeOpenProbability;
         final double avgEyeOpenness = (leftProb != null && rightProb != null)
             ? (leftProb + rightProb) / 2.0
             : 1.0;
 
-        // -- 4b (Member 3): TFLite eye-classifier on Y-plane crop ------------
-        // Only run when ML Kit found an eye landmark so the crop is valid.
-        // Returns 1 (open) or 0 (closed); -1 if model not yet loaded.
         int tfliteEyeResult = 1;
         final leftLm  = face.landmarks[FaceLandmarkType.leftEye];
-        final rightLm = face.landmarks[FaceLandmarkType.rightEye];
         if (leftLm != null && Platform.isAndroid) {
-          // Choose whichever eye landmark is available; left is preferred.
           final lm = leftLm;
           final crop = _extractEyeCrop(
             rawBytes, image.width, image.height,
@@ -298,10 +284,6 @@ class _MapScreenState extends State<MapScreen> {
           tfliteEyeResult = await _eyeClassifierService.classifyEye(crop);
         }
 
-        // -- 4c: Eye-closure decision ----------------------------------------
-        // Primary signal: ML Kit probability vs user-configured threshold.
-        // Secondary: TFLite binary result (0 = closed).
-        // Using || keeps sensitivity high; the 3-frame debounce prevents noise.
         final bool mlKitClosed = leftProb != null &&
             rightProb != null &&
             leftProb  < eyeClosureThreshold &&
@@ -318,16 +300,12 @@ class _MapScreenState extends State<MapScreen> {
           _closedEyeFrames = 0;
         }
 
-        // -- 4d (Member 2): Head-pose analysis --------------------------------
         final HeadPoseResult? poseResult = _headPoseService.analyze(face);
         HeadPoseAlertLevel poseLevel = HeadPoseAlertLevel.safe;
 
         if (poseResult != null && mounted) {
           poseLevel = poseResult.level;
 
-          // User-configured tilt sensitivity gate: if the actual roll or pitch
-          // angle exceeds headTiltSensitivity AND the service also says critical,
-          // fire the alarm. This honours the settings slider.
           final double maxAngle = poseResult.rollAngle.abs()
               .clamp(0, double.infinity)
               .toDouble();
@@ -353,25 +331,22 @@ class _MapScreenState extends State<MapScreen> {
             setState(() => _headPoseWarning = false);
           }
 
-          // -- 4e: Update HUD telemetry ---------------------------------------
           setState(() {
-            _hudFaceDetected    = true;
-            _hudEyeOpenness     = avgEyeOpenness;
-            _hudHeadTiltAngle   = poseResult.rollAngle.abs();
-            _hudSafetyLevel     = poseLevel;
+            _hudFaceDetected  = true;
+            _hudEyeOpenness   = avgEyeOpenness;
+            _hudHeadTiltAngle = poseResult.rollAngle.abs();
+            _hudSafetyLevel   = poseLevel;
+            _currentFace = face; // For dev mode
+            _cameraImageSize = Size(image.height.toDouble(), image.width.toDouble()); // Rotated size
           });
-        } else if (poseResult == null) {
-          // Pose data not yet available this frame; keep previous HUD values
-          // but mark face as detected so the HUD doesn't show "No Face".
-          if (mounted) setState(() => _hudFaceDetected = true);
         }
       } else {
-        // No face: clear warnings and reset HUD to idle state.
         if (mounted) {
           setState(() {
             _hudFaceDetected  = false;
             _hudSafetyLevel   = HeadPoseAlertLevel.safe;
             _headPoseWarning  = false;
+            _currentFace = null; // Clear dev mode tracking
           });
         }
       }
@@ -402,21 +377,13 @@ class _MapScreenState extends State<MapScreen> {
     if (_isDrowsy) {
       setState(() {
         _isDrowsy = false;
-        _alertMessage = "WAKE UP!"; // reset for next trigger
+        _alertMessage = "WAKE UP!"; 
       });
-      // Reset head pose counters so they don't carry over into the next cycle.
       _headPoseService.reset();
       await _audioPlayer.stop();
     }
   }
 
-  /// Extracts a [size]×[size] grayscale patch from the NV21 Y-plane centered
-  /// on the eye landmark at ([cx], [cy]) and returns it as a
-  /// [1][size][size][1] float tensor normalised to [0, 1].
-  ///
-  /// NV21 Y-plane: first [imgW * imgH] bytes of the concatenated plane buffer.
-  /// Pixel coordinates from ML Kit are in the rotated (display) image space.
-  /// For NV21 with rotation270: sensor_x = display_y, sensor_y = imgW-display_x.
   List<List<List<List<double>>>> _extractEyeCrop(
     Uint8List yPlane, int imgW, int imgH, int cx, int cy, int size,
   ) {
@@ -459,7 +426,7 @@ class _MapScreenState extends State<MapScreen> {
                   children: [
                     const Icon(Icons.remove_red_eye, color: Colors.blueAccent, size: 28),
                     const SizedBox(width: 10),
-                    Text(
+                    const Text(
                       'Iris Maps',
                       style: TextStyle(
                         color: Colors.white,
@@ -498,17 +465,23 @@ class _MapScreenState extends State<MapScreen> {
                         headTiltSensitivity: headTiltSensitivity,
                         isImageEnhancementEnabled: isImageEnhancementEnabled,
                         isAlarmVolumeOn: isAlarmVolumeOn,
+                        showLiveStatusHud: showLiveStatusHud, // Pass to settings
+                        isDeveloperModeEnabled: isDeveloperModeEnabled, // Pass to settings
                         onChanged: ({
                           required double eye,
                           required double tilt,
                           required bool enhance,
                           required bool alarm,
+                          required bool hud, // Receive from settings
+                          required bool devMode, // Receive from settings
                         }) {
                           setState(() {
                             eyeClosureThreshold = eye;
                             headTiltSensitivity = tilt;
                             isImageEnhancementEnabled = enhance;
                             isAlarmVolumeOn = alarm;
+                            showLiveStatusHud = hud;
+                            isDeveloperModeEnabled = devMode;
                           });
                         },
                       ),
@@ -583,8 +556,6 @@ class _MapScreenState extends State<MapScreen> {
           // ==========================================
           // LAYER 2: FLOATING UI ELEMENTS
           // ==========================================
-
-          // --- Floating Search Bar (Top) ---
           Positioned(
             top: 50.0,
             left: 16.0,
@@ -693,17 +664,49 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
+          // ==========================================
+          // LAYER 2b: DEVELOPER MODE PiP (Camera Feed & Bounding Boxes)
+          // ==========================================
+          if (isDeveloperModeEnabled && _cameraController != null && _cameraController!.value.isInitialized)
+            Positioned(
+              top: 120.0,
+              right: 16.0,
+              width: 140.0,
+              height: 210.0,
+              child: Container(
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.greenAccent, width: 2),
+                  color: Colors.black,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CameraPreview(_cameraController!),
+                      if (_currentFace != null && _cameraImageSize != null)
+                        CustomPaint(
+                          painter: FaceOverlayPainter(_currentFace!, _cameraImageSize!),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
           // --- Enhancement Toggle Button (Bottom Left) ---
           Positioned(
             bottom: 30.0,
             left: 16.0,
             child: GestureDetector(
-              onTap: () => setState(() => _enhancementService.toggle()),
+              // FIX: Now modifies the state variable directly so it doesn't get instantly overwritten by the camera loop
+              onTap: () => setState(() => isImageEnhancementEnabled = !isImageEnhancementEnabled),
               child: Container(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                 decoration: BoxDecoration(
-                  color: _enhancementService.isEnabled
+                  color: isImageEnhancementEnabled
                       ? Colors.blueAccent.withValues(alpha: 0.85)
                       : Colors.grey[800]!.withValues(alpha: 0.85),
                   borderRadius: BorderRadius.circular(20),
@@ -719,18 +722,18 @@ class _MapScreenState extends State<MapScreen> {
                   children: [
                     Icon(
                       Icons.brightness_6,
-                      color: _enhancementService.isEnabled
+                      color: isImageEnhancementEnabled
                           ? Colors.white
                           : Colors.white54,
                       size: 16,
                     ),
                     const SizedBox(width: 6),
                     Text(
-                      _enhancementService.isEnabled
+                      isImageEnhancementEnabled
                           ? 'Enhance: ON'
                           : 'Enhance: OFF',
                       style: TextStyle(
-                        color: _enhancementService.isEnabled
+                        color: isImageEnhancementEnabled
                             ? Colors.white
                             : Colors.white54,
                         fontSize: 12,
@@ -743,22 +746,19 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
-          // ==========================================
-          // LAYER 2b: LIVE STATUS HUD CARD
-          // Compact telemetry overlay showing live pipeline outputs from all
-          // three CV modules. Positioned bottom-left, above the toggle button.
-          // ==========================================
-          Positioned(
-            bottom: 90.0,
-            left: 16.0,
-            child: _HudCard(
-              faceDetected: _hudFaceDetected,
-              eyeOpenness: _hudEyeOpenness,
-              headTiltAngle: _hudHeadTiltAngle,
-              enhancementOn: isImageEnhancementEnabled,
-              safetyLevel: _hudSafetyLevel,
+          // --- HUD Card (Bottom Left, Toggleable via Settings) ---
+          if (showLiveStatusHud)
+            Positioned(
+              bottom: 90.0,
+              left: 16.0,
+              child: _HudCard(
+                faceDetected: _hudFaceDetected,
+                eyeOpenness: _hudEyeOpenness,
+                headTiltAngle: _hudHeadTiltAngle,
+                enhancementOn: isImageEnhancementEnabled,
+                safetyLevel: _hudSafetyLevel,
+              ),
             ),
-          ),
 
           // --- Floating Action Buttons (Bottom Right) ---
           Positioned(
@@ -802,9 +802,6 @@ class _MapScreenState extends State<MapScreen> {
 
           // ==========================================
           // LAYER 3: HEAD POSE WARNING BANNER
-          // Non-blocking orange banner for warning-level head pose events
-          // (e.g. looking away, early sideways tilt).
-          // Only visible when there is no full-screen alarm active.
           // ==========================================
           if (_headPoseWarning &&
               _headPoseWarningMessage != null &&
@@ -848,8 +845,6 @@ class _MapScreenState extends State<MapScreen> {
 
           // ==========================================
           // LAYER 4: FULL-SCREEN "WAKE UP" OVERLAY
-          // Fires for both eye-closure and critical head-pose events.
-          // The _alertMessage field reflects which condition triggered it.
           // ==========================================
           IgnorePointer(
             ignoring: !_isDrowsy,
@@ -901,9 +896,61 @@ class _MapScreenState extends State<MapScreen> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Custom Painter for Developer Mode
+// Maps ML Kit bounding boxes and landmarks over the camera preview.
+// ════════════════════════════════════════════════════════════════════════════
+class FaceOverlayPainter extends CustomPainter {
+  final Face face;
+  final Size absoluteImageSize;
+
+  FaceOverlayPainter(this.face, this.absoluteImageSize);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..color = Colors.greenAccent;
+
+    // Scale factors to map the raw ML Kit coordinates to the UI rendering box
+    final double scaleX = size.width / absoluteImageSize.width;
+    final double scaleY = size.height / absoluteImageSize.height;
+
+    // Draw the main bounding box around the face
+    final rect = Rect.fromLTRB(
+      face.boundingBox.left * scaleX,
+      face.boundingBox.top * scaleY,
+      face.boundingBox.right * scaleX,
+      face.boundingBox.bottom * scaleY,
+    );
+    canvas.drawRect(rect, paint);
+
+    // Draw red dots for all detected facial landmarks (eyes, nose, cheeks, etc.)
+    final landmarkPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.redAccent;
+
+    for (final landmark in face.landmarks.values) {
+      // FIX: Check if the landmark is null before accessing its position
+      if (landmark != null) {
+        canvas.drawCircle(
+          Offset(landmark.position.x.toDouble() * scaleX,
+              landmark.position.y.toDouble() * scaleY),
+          3,
+          landmarkPaint,
+        );
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(FaceOverlayPainter oldDelegate) {
+    return oldDelegate.face != face || oldDelegate.absoluteImageSize != absoluteImageSize;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // HUD Card Widget
-// Displays live outputs from all three CV pipeline modules in a compact,
-// always-visible overlay. Purely stateless — driven by _MapScreenState.
 // ════════════════════════════════════════════════════════════════════════════
 class _HudCard extends StatelessWidget {
   final bool faceDetected;
@@ -935,7 +982,7 @@ class _HudCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 192,
+      width: 210,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.72),
@@ -970,10 +1017,10 @@ class _HudCard extends StatelessWidget {
           const SizedBox(height: 7),
 
           if (!faceDetected) ...[
-            _HudRow(
+            const _HudRow(
               icon: Icons.face_retouching_off,
               label: 'No face detected',
-              valueWidget: const SizedBox.shrink(),
+              valueWidget: SizedBox.shrink(),
               iconColor: Colors.white38,
             ),
           ] else ...[

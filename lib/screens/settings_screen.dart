@@ -5,6 +5,8 @@ typedef SettingsChangedCallback = void Function({
   required double tilt,
   required bool enhance,
   required bool alarm,
+  required bool hud,
+  required bool devMode,
 });
 
 class SettingsScreen extends StatefulWidget {
@@ -12,6 +14,8 @@ class SettingsScreen extends StatefulWidget {
   final double headTiltSensitivity;
   final bool isImageEnhancementEnabled;
   final bool isAlarmVolumeOn;
+  final bool showLiveStatusHud;
+  final bool isDeveloperModeEnabled;
   final SettingsChangedCallback onChanged;
 
   const SettingsScreen({
@@ -20,6 +24,8 @@ class SettingsScreen extends StatefulWidget {
     required this.headTiltSensitivity,
     required this.isImageEnhancementEnabled,
     required this.isAlarmVolumeOn,
+    required this.showLiveStatusHud,
+    required this.isDeveloperModeEnabled,
     required this.onChanged,
   });
 
@@ -32,6 +38,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late double _tilt;
   late bool _enhance;
   late bool _alarm;
+  late bool _hud;
+  late bool _devMode;
 
   @override
   void initState() {
@@ -40,10 +48,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _tilt = widget.headTiltSensitivity;
     _enhance = widget.isImageEnhancementEnabled;
     _alarm = widget.isAlarmVolumeOn;
+    _hud = widget.showLiveStatusHud;
+    _devMode = widget.isDeveloperModeEnabled;
   }
 
   void _propagate() {
-    widget.onChanged(eye: _eye, tilt: _tilt, enhance: _enhance, alarm: _alarm);
+    widget.onChanged(
+      eye: _eye,
+      tilt: _tilt,
+      enhance: _enhance,
+      alarm: _alarm,
+      hud: _hud,
+      devMode: _devMode,
+    );
   }
 
   @override
@@ -145,6 +162,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: _alarm,
             onChanged: (v) {
               setState(() => _alarm = v);
+              _propagate();
+            },
+          ),
+
+          const SizedBox(height: 16),
+
+          // ── Live Status HUD ────────────────────────────────────────────────
+          _SectionHeader(title: 'Live Status HUD'),
+          _SettingDescription(
+            text: 'Show or hide the real-time telemetry overlay on the map screen.',
+          ),
+          _ToggleTile(
+            label: 'Show HUD',
+            value: _hud,
+            onChanged: (v) {
+              setState(() => _hud = v);
+              _propagate();
+            },
+          ),
+
+          const SizedBox(height: 16),
+
+          // ── Developer Mode ─────────────────────────────────────────────────
+          _SectionHeader(title: 'Developer Mode'),
+          _SettingDescription(
+            text: 'Show the raw camera feed with ML Kit face landmarks and bounding boxes.',
+          ),
+          _ToggleTile(
+            label: 'Enable Developer Mode',
+            value: _devMode,
+            onChanged: (v) {
+              setState(() => _devMode = v);
               _propagate();
             },
           ),
