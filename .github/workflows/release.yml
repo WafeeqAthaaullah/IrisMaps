@@ -28,9 +28,12 @@ jobs:
       - name: Build APK
         run: flutter build apk --release
 
+      - name: Rename APK (Optional but recommended)
+        run: mv build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/IrisMaps.apk
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: build/app/outputs/flutter-apk/IrisMap.apk
+          files: build/app/outputs/flutter-apk/IrisMaps.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
