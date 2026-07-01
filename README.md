@@ -75,7 +75,7 @@ Iris Maps is a Flutter-based safety assistant for drivers that combines real-tim
 ![Main navigation view](screenshots/main.jpeg)
 ![Alert Screen](screenshots/alert.jpeg)
 ![Alert History Screen](screenshots/history.jpeg)
-![Settings screen](screenshots/settings.png)
+![Settings screen](screenshots/settings.jpeg)
 
 
 ## Notes
