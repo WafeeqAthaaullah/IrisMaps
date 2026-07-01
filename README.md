@@ -1,75 +1,98 @@
-# 👁️ Iris Maps - AI Navigation System
+# 👁️ Iris Maps
 
-Iris Maps is a high-performance **Flutter** application designed to prevent drowsy driving. It features real-time GPS routing integrated with on-device **AI computer vision** to monitor driver alertness and trigger life-saving alerts.
+Iris Maps is a Flutter-based safety assistant for drivers that combines real-time navigation with on-device computer vision. The app monitors driver alertness, highlights suspicious drowsiness patterns, and can trigger an audible wake-up alarm when attention appears to drop.
 
-## Features
+## What the app does
 
-  - **Drowsiness Detection**: Real-time eye-tracking using Google ML Kit to calculate "Eye Open" probability at 30fps.
-  - **Active Wake-Up System**: High-frequency audio alarms and full-screen visual overlays to alert drowsy drivers.
-  - **Smart Routing**: Live navigation with destination search and dynamic polyline path drawing.
-  - **Dark Mode Optimization**: Sleek, low-glare dark-mode tiles designed for nighttime road safety.
+- Detects possible drowsiness using the device camera and face analysis.
+- Uses on-device AI models and ML Kit face landmarks to estimate eye state.
+- Displays a live map with GPS location, destination search, and route drawing.
+- Provides a wake-up alarm and visual feedback to encourage the driver to stay alert.
+- Includes settings and stats screens for tuning and reviewing behavior.
 
-## Tech Stack
+## Key features
 
-  - **Frontend**: Flutter (Dart)
-  - **AI & Vision**: 
-      - `camera`: For real-time frame streaming.
-      - `google_mlkit_face_detection`: For on-device facial landmark processing.
-  - **Mapping**:
-      - `flutter_map`: Open-source mapping engine.
-      - `latlong2`: For geographic coordinate math.
-  - **Utilities**:
-      - `geolocator`: High-accuracy GPS location services.
-      - `audioplayers`: For triggering the emergency wake-up alarm.
-      - `http`: To communicate with OSRM and Nominatim APIs.
+- Real-time camera feed for driver monitoring
+- Eye-state classification using TensorFlow Lite and ML Kit
+- Live map rendering with OpenStreetMap-based tiles
+- Route fetching from OSRM and destination search through Nominatim
+- Audio alert playback with a local alarm asset
+- Developer-friendly camera overlay and telemetry mode
 
-## Getting Started
+## Tech stack
 
-### Prerequisites
+- Flutter and Dart
+- Camera plugin for live frame capture
+- Google ML Kit Face Detection for landmark extraction
+- TensorFlow Lite via tflite_flutter for on-device inference
+- flutter_map and latlong2 for map rendering and coordinates
+- geolocator for GPS access
+- audioplayers for alarm playback
+- http for routing and geocoding APIs
 
-  - Flutter SDK (v3.22 or higher)
-  - Android SDK (API 35+ recommended)
-  - A physical Android device (Required for AI hardware acceleration)
+## Project structure
 
-### Installation
+- lib/main.dart: main app UI, map screen, camera loop, navigation logic
+- lib/screens/settings_screen.dart: configurable app settings
+- lib/screens/stats_screen.dart: alert and usage statistics UI
+- lib/services/: camera, head-pose, image-enhancement, and eye-classification services
 
-1.  **Clone the repository**:
-    
-    ``` bash
-    git clone [https://github.com/WafeeqAthaaullah/IrisMaps.git](https://github.com/WafeeqAthaaullah/IrisMaps.git)
-    
-    ```
+## Prerequisites
 
-2.  **Install dependencies**:
-    
-    ``` bash
-    flutter pub get
-    
-    ```
+- Flutter SDK 3.11 or newer
+- Android SDK with camera and location support
+- A physical Android device is strongly recommended for reliable camera-based monitoring
 
-3.  **Configure Assets**:
-    Ensure an `alarm.mp3` file exists in the `assets/` folder and is declared in `pubspec.yaml`:
-    
-    ``` yaml
-    flutter:
-      assets:
-        - assets/alarm.mp3
-    
-    ```
+## Getting started
 
-### Running the App
+1. Clone the repository
 
-  - **Debug Mode**:
-    ``` bash
-    flutter run
-    
-    ```
-  - **Build Release APK**:
-    ``` bash
-    flutter build apk --release
-    
-    ```
+   ```bash
+   git clone https://github.com/WafeeqAthaaullah/IrisMaps.git
+   cd IrisMaps
+   ```
+
+2. Install dependencies
+
+   ```bash
+   flutter pub get
+   ```
+
+3. Run the app
+
+   ```bash
+   flutter run
+   ```
+
+4. Build a release APK if needed
+
+   ```bash
+   flutter build apk --release
+   ```
+
+## App screenshots
+
+Add screenshots to the repository and reference them here once available:
+
+- Main navigation view
+- Driver monitoring camera overlay
+- Settings and stats screens
+
+Example:
+
+```md
+![Main navigation view](screenshots/main.jpeg)
+![Alert Screen](screenshots/alert.jpeg)
+![Alert History Screen](screenshots/history.jpeg)
+![Settings screen](screenshots/settings.png)
+```
+
+## Notes
+
+- This application is intended as a safety aid and should not be treated as a medical device.
+- Camera and location permissions are required for full functionality.
+- The app is optimized for Android and uses device hardware for real-time inference.
 
 ## License
 
-This project is licensed under the **MIT License**.
+This project is licensed under the MIT License.
